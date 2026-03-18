@@ -1220,6 +1220,16 @@
         "sha": "05ea4d1128d46618266bbcc23a5e7019c57be0d6"
       },
       "homepage": "https://www.helius.dev/docs"
+    },
+    {
+      "name": "atlan",
+      "description": "Atlan data catalog plugin for Claude Code. Search, explore, govern, and manage your data assets through natural language. Powered by the Atlan MCP server with semantic search, lineage traversal, glossary management, data quality rules, and more.",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/atlanhq/agent-toolkit.git",
+        "sha": "acdf284da6aa98b14f8dad90a9827006d8df425c"
+      },
+      "homepage": "https://docs.atlan.com/"
     }
   ]
 }
