@@ -561,6 +561,235 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
 await mcp.connect(new StdioServerTransport())
 
+// ── Remote approval system ──────────────────────────────────────────────
+// Receives PreToolUse hook requests over HTTP, sends inline keyboard to
+// Telegram, waits for the user to tap Approve/Deny, returns the decision.
+
+const APPROVAL_PORT = Number(process.env.TELEGRAM_APPROVAL_PORT ?? 18321)
+const APPROVAL_TIMEOUT_MS = Number(process.env.TELEGRAM_APPROVAL_TIMEOUT ?? 120_000) // 2 min default
+
+type PendingApproval = {
+  resolve: (decision: 'allow' | 'deny') => void
+  timer: ReturnType<typeof setTimeout>
+  chatId: string
+  msgId?: number
+}
+
+const pendingApprovals = new Map<string, PendingApproval>()
+
+// Handle inline keyboard callback queries (Approve / Deny buttons)
+bot.on('callback_query:data', async ctx => {
+  const data = ctx.callbackQuery.data
+  if (!data.startsWith('approve:') && !data.startsWith('deny:')) return
+
+  const [action, approvalId] = data.split(':')
+  const pending = pendingApprovals.get(approvalId)
+  if (!pending) {
+    await ctx.answerCallbackQuery({ text: '⏰ 已過期' })
+    return
+  }
+
+  // Verify sender is in allowlist
+  const senderId = String(ctx.from.id)
+  const access = loadAccess()
+  if (!access.allowFrom.includes(senderId)) {
+    await ctx.answerCallbackQuery({ text: '⛔ 未授權' })
+    return
+  }
+
+  const decision = action === 'approve' ? 'allow' as const : 'deny' as const
+  clearTimeout(pending.timer)
+  pending.resolve(decision)
+  pendingApprovals.delete(approvalId)
+
+  const emoji = decision === 'allow' ? '✅' : '❌'
+  const label = decision === 'allow' ? '已批准' : '已拒絕'
+
+  await ctx.answerCallbackQuery({ text: `${emoji} ${label}` })
+
+  // Update the message to show the decision
+  if (pending.msgId) {
+    try {
+      await bot.api.editMessageReplyMarkup(pending.chatId, pending.msgId, {
+        reply_markup: undefined,
+      })
+    } catch {}
+    try {
+      await bot.api.editMessageText(
+        pending.chatId,
+        pending.msgId,
+        `${emoji} ${label}`,
+      )
+    } catch {}
+  }
+})
+
+// ── Danger detection ────────────────────────────────────────────────────
+
+const DANGEROUS_BASH = [
+  /(?:^|\s|;|&&|\|\|)(?:rm|rmdir)\s/i,
+  /(?:^|\s|;|&&|\|\|)(?:sudo|kill|killall|pkill)\s/i,
+  /(?:^|\s|;|&&|\|\|)(?:chmod|chown|dd|mkfs)\s/i,
+  /git\s+push/i,
+  /git\s+reset\s+--hard/i,
+  /git\s+checkout\s+--\s/i,
+  /git\s+clean\s+-f/i,
+  /git\s+branch\s+-[dD]\s/i,
+  /git\s+rebase/i,
+  /docker\s+(?:rm|stop|kill|system\s+prune)/i,
+  /docker-compose\s+down/i,
+  /npm\s+publish/i,
+  /pip\s+install\s+--break/i,
+  /(?:curl|wget)\s.*\|\s*(?:bash|sh|zsh)/i,
+]
+
+const SENSITIVE_PATHS = [
+  /\.claude\/(?:settings|settings\.local)\.json$/i,
+  /CLAUDE\.md$/i,
+  /\.claude\/.*\.json$/i,
+  /\.env$/i,
+]
+
+function isDangerous(toolName: string, toolInput: Record<string, unknown>): boolean {
+  if (toolName === 'Bash') {
+    const cmd = String(toolInput.command ?? '')
+    return DANGEROUS_BASH.some(re => re.test(cmd))
+  }
+  if (toolName === 'Write' || toolName === 'Edit') {
+    const fp = String(toolInput.file_path ?? '')
+    return SENSITIVE_PATHS.some(re => re.test(fp))
+  }
+  return false
+}
+
+const ALLOW_JSON = Response.json({
+  hookSpecificOutput: {
+    hookEventName: 'PreToolUse',
+    permissionDecision: 'allow',
+    permissionDecisionReason: 'remote mode: auto-approved safe operation',
+  },
+})
+
+// ── Display helpers ─────────────────────────────────────────────────────
+
+function truncate(s: string, max: number): string {
+  return s.length <= max ? s : s.slice(0, max - 1) + '…'
+}
+
+function formatToolDetails(toolName: string, toolInput: Record<string, unknown>): string {
+  let detail = ''
+  if (toolName === 'Bash' && toolInput.command) {
+    detail = `\n📝 ${truncate(String(toolInput.command), 500)}`
+  } else if ((toolName === 'Write' || toolName === 'Edit') && toolInput.file_path) {
+    detail = `\n📄 ${toolInput.file_path}`
+  } else {
+    const keys = Object.keys(toolInput)
+    if (keys.length > 0) {
+      const preview = keys.slice(0, 3).map(k => `${k}: ${truncate(String(toolInput[k]), 100)}`).join('\n')
+      detail = `\n${preview}`
+    }
+  }
+  return `🔧 工具: ${toolName}${detail}`
+}
+
+// ── HTTP server for hook requests ───────────────────────────────────────
+
+const approvalServer = Bun.serve({
+  port: APPROVAL_PORT,
+  hostname: '127.0.0.1',
+  fetch: async (req) => {
+    if (req.method !== 'POST') {
+      return new Response('method not allowed', { status: 405 })
+    }
+
+    const url = new URL(req.url)
+    if (url.pathname !== '/approve') {
+      return new Response('not found', { status: 404 })
+    }
+
+    let body: Record<string, unknown>
+    try {
+      body = await req.json() as Record<string, unknown>
+    } catch {
+      return new Response('bad request', { status: 400 })
+    }
+
+    const toolName = String(body.tool_name ?? '')
+    const toolInput = (body.tool_input ?? {}) as Record<string, unknown>
+
+    // Safe operation — auto-approve, no Telegram prompt
+    if (!isDangerous(toolName, toolInput)) {
+      return ALLOW_JSON
+    }
+
+    // Dangerous operation — forward to Telegram for approval
+    const access = loadAccess()
+    const targetChat = access.allowFrom[0]
+    if (!targetChat) {
+      return Response.json({
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'ask',
+          permissionDecisionReason: 'no allowlisted chat for remote approval',
+        },
+      })
+    }
+
+    const approvalId = randomBytes(4).toString('hex')
+    const text = formatToolDetails(toolName, toolInput)
+
+    try {
+      const sent = await bot.api.sendMessage(targetChat, text, {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '✅ Approve', callback_data: `approve:${approvalId}` },
+              { text: '❌ Deny', callback_data: `deny:${approvalId}` },
+            ],
+          ],
+        },
+      })
+
+      const decision = await new Promise<'allow' | 'deny'>((resolve) => {
+        const timer = setTimeout(() => {
+          pendingApprovals.delete(approvalId)
+          resolve('deny')
+          // Remove inline keyboard on timeout
+          bot.api.editMessageText(targetChat, sent.message_id, '⏰ 已逾時 — 已自動拒絕').catch(() => {})
+        }, APPROVAL_TIMEOUT_MS)
+
+        pendingApprovals.set(approvalId, {
+          resolve,
+          timer,
+          chatId: targetChat,
+          msgId: sent.message_id,
+        })
+      })
+
+      return Response.json({
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: decision,
+          permissionDecisionReason: `remote ${decision === 'allow' ? 'approved' : 'denied'} via Telegram`,
+        },
+      })
+    } catch (err) {
+      process.stderr.write(`telegram channel: approval request failed: ${err}\n`)
+      return Response.json({
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'ask',
+          permissionDecisionReason: 'remote approval failed, falling back to terminal',
+        },
+      })
+    }
+  },
+})
+
+process.stderr.write(`telegram channel: approval server listening on 127.0.0.1:${APPROVAL_PORT}\n`)
+
+// ── End remote approval system ──────────────────────────────────────────
+
 // When Claude Code closes the MCP connection, stdin gets EOF. Without this
 // the bot keeps polling forever as a zombie, holding the token and blocking
 // the next session with 409 Conflict.
@@ -569,6 +798,13 @@ function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
   process.stderr.write('telegram channel: shutting down\n')
+  // Reject all pending approvals so hooks don't hang
+  for (const [id, pending] of pendingApprovals) {
+    clearTimeout(pending.timer)
+    pending.resolve('deny')
+    pendingApprovals.delete(id)
+  }
+  approvalServer.stop()
   // bot.stop() signals the poll loop to end; the current getUpdates request
   // may take up to its long-poll timeout to return. Force-exit after 2s.
   setTimeout(() => process.exit(0), 2000)
