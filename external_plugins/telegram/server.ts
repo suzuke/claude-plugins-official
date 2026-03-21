@@ -19,6 +19,7 @@ import { Bot, GrammyError, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
+import { readFile, unlink } from 'fs/promises'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 
@@ -50,6 +51,7 @@ if (!TOKEN) {
   process.exit(1)
 }
 const INBOX_DIR = join(STATE_DIR, 'inbox')
+const GROQ_API_KEY = process.env.GROQ_API_KEY
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
@@ -662,13 +664,15 @@ function isDangerous(toolName: string, toolInput: Record<string, unknown>): bool
   return false
 }
 
-const ALLOW_JSON = Response.json({
-  hookSpecificOutput: {
-    hookEventName: 'PreToolUse',
-    permissionDecision: 'allow',
-    permissionDecisionReason: 'remote mode: auto-approved safe operation',
-  },
-})
+function makeAllowResponse() {
+  return Response.json({
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'allow',
+      permissionDecisionReason: 'remote mode: auto-approved safe operation',
+    },
+  })
+}
 
 // ── Display helpers ─────────────────────────────────────────────────────
 
@@ -719,7 +723,7 @@ const approvalServer = Bun.serve({
 
     // Safe operation — auto-approve, no Telegram prompt
     if (!isDangerous(toolName, toolInput)) {
-      return ALLOW_JSON
+      return makeAllowResponse()
     }
 
     // Dangerous operation — forward to Telegram for approval
@@ -914,15 +918,59 @@ bot.on('message:document', async ctx => {
   })
 })
 
-bot.on('message:voice', async ctx => {
-  const voice = ctx.message.voice
-  const text = ctx.message.caption ?? '(voice message)'
-  await handleInbound(ctx, text, undefined, {
-    kind: 'voice',
-    file_id: voice.file_id,
-    size: voice.file_size,
-    mime: voice.mime_type,
+async function transcribeAudio(filePath: string): Promise<string> {
+  if (!GROQ_API_KEY) throw new Error('GROQ_API_KEY not set — cannot transcribe voice')
+  const fileData = await readFile(filePath)
+  const blob = new Blob([fileData], { type: 'audio/ogg' })
+  const form = new FormData()
+  form.append('file', blob, 'voice.ogg')
+  form.append('model', 'whisper-large-v3-turbo')
+  form.append('response_format', 'json')
+  const res = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${GROQ_API_KEY}` },
+    body: form,
   })
+  if (!res.ok) {
+    const err = await res.text()
+    throw new Error(`Groq transcription failed (${res.status}): ${err}`)
+  }
+  const json = (await res.json()) as { text: string }
+  return json.text
+}
+
+bot.on('message:voice', async ctx => {
+  const gateResult = gate(ctx)
+  if (gateResult.action === 'drop') return
+  if (gateResult.action === 'pair') {
+    const lead = gateResult.isResend ? 'Still pending' : 'Pairing required'
+    await ctx.reply(`${lead} — run in Claude Code:\n\n/telegram:access pair ${gateResult.code}`)
+    return
+  }
+
+  let transcription = '(voice message — transcription failed)'
+  try {
+    const voice = ctx.message.voice
+    const file = await ctx.api.getFile(voice.file_id)
+    if (file.file_path) {
+      const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
+      const res = await fetch(url)
+      const buf = Buffer.from(await res.arrayBuffer())
+      const rawExt = file.file_path.includes('.') ? file.file_path.split('.').pop()! : 'ogg'
+      const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || 'ogg'
+      const uniqueId = (voice.file_unique_id ?? '').replace(/[^a-zA-Z0-9_-]/g, '') || 'voice'
+      const path = join(INBOX_DIR, `${Date.now()}-${uniqueId}.${ext}`)
+      mkdirSync(INBOX_DIR, { recursive: true })
+      writeFileSync(path, buf)
+      transcription = await transcribeAudio(path)
+      await unlink(path).catch(() => {})
+    }
+  } catch (err) {
+    process.stderr.write(`telegram channel: voice transcription failed: ${err}\n`)
+  }
+
+  const prefix = '[voice message transcription] '
+  await handleInbound(ctx, prefix + transcription, undefined)
 })
 
 bot.on('message:audio', async ctx => {
