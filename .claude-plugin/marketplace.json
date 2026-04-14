@@ -886,8 +886,7 @@
       "description": "Nimble web data toolkit — search, extract, map, crawl the web and work with structured data agents",
       "source": {
         "source": "url",
-        "url": "https://github.com/Nimbleway/agent-skills.git",
-        "sha": "cf391e95bd8ac009e3641f172434a1d130dde7fe"
+        "url": "https://github.com/Nimbleway/agent-skills.git"
       },
       "homepage": "https://docs.nimbleway.com/integrations/agent-skills/plugin-installation"
     },
